@@ -155,133 +155,71 @@ class FFN(nn.Module):
         x = self.fc2(x)
         return x
 
-class Transformer(nn.Module):
-    def __init__(self, args):
+class SelfAttentionBlock(torch.nn.Module):
+    def __init__(self, d_model, num_heads, dropout_rate=0.1, attention_dropout_rate=0.1):
         super().__init__()
-        self.N = args.num_layers
-        self.d = args.hid_dim
-        self.dff = self.d * 2
-        self.attention_dropout = args.attention_dropout
-        self.dropout = args.dropout
-        self.h = args.num_heads
-        self.dk = self.d // self.h
-        self.all_head_size = self.dk * self.h
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads # dimension per head
 
-        self.Wq = nn.Parameter(self.init_proj((self.N, self.h, self.d, self.dk)), requires_grad=True)
-        self.Wk = nn.Parameter(self.init_proj((self.N, self.h, self.d, self.dk)), requires_grad=True)
-        self.Wv = nn.Parameter(self.init_proj((self.N, self.h, self.d, self.dk)), requires_grad=True)
-        self.Wo = nn.Parameter(self.init_proj((self.N, self.all_head_size, self.d)), requires_grad=True)
-        self.W1 = nn.Parameter(self.init_proj((self.N, self.d, self.dff)), requires_grad=True)
-        self.b1 = nn.Parameter(torch.zeros((self.N, 1, 1, self.dff)), requires_grad=True)
-        self.W2 = nn.Parameter(self.init_proj((self.N, self.dff, self.d)), requires_grad=True)
-        self.b2 = nn.Parameter(torch.zeros((self.N, 1, 1, self.d)), requires_grad=True)
+        # Linear layers for Q, K, V projections (for one layer/head_set)
+        self.Wq = torch.nn.Parameter(torch.empty(num_heads, d_model, self.d_k))
+        self.Wk = torch.nn.Parameter(torch.empty(num_heads, d_model, self.d_k))
+        self.Wv = torch.nn.Parameter(torch.empty(num_heads, d_model, self.d_k))
+        self.Wo = torch.nn.Parameter(torch.empty(num_heads * self.d_k, d_model))
 
-    def init_proj(self, shape, gain=1):
-        x = torch.rand(shape)
-        fan_in_out = shape[-1] + shape[-2]
-        scale = gain * np.sqrt(6 / fan_in_out)
-        x = x * 2 * scale - scale
-        return x
+        self.dropout = dropout_rate
+        self.attention_dropout = attention_dropout_rate
 
-    def forward(self, x, mask):
-        # x: bsz, max_len, d
-        # mask: bsz, max_len
-        bsz, max_len, _ = x.size()
-        mask = mask[:, :, None] * mask[:, None, :]
-        mask = (1 - mask)[:, None, :, :] * torch.finfo(x.dtype).min
-        layer_mask = mask
-        for i in range(self.N):
-            # MHA
-            q = torch.einsum('bld,hde->bhle', x, self.Wq[i])  # bsz,h,max_len,dk
-            k = torch.einsum('bld,hde->bhle', x, self.Wk[i])  # bsz,h,max_len,dk
-            v = torch.einsum('bld,hde->bhle', x, self.Wv[i])  # bsz,h,max_len,dk
-            A = torch.einsum('bhle,bhke->bhlk', q, k)  # bsz,h,max_len,max_len
-            if self.training:
-                dropout_mask = (torch.rand_like(A) < self.attention_dropout
-                                ).float() * torch.finfo(x.dtype).min
-                layer_mask = mask + dropout_mask
-            A = A + layer_mask
-            A = torch.softmax(A, dim=-1)
-            v = torch.einsum('bhkl,bhle->bkhe', A, v)  # bsz,max_len,h,dk
-            all_head_op = v.reshape((bsz, max_len, -1))
-            all_head_op = torch.matmul(all_head_op, self.Wo[i])
-            all_head_op = F.dropout(all_head_op, self.dropout, self.training)
-            # Add+layernorm
-            x = (all_head_op + x) / 2
-            # FFN
-            ffn_op = torch.matmul(x, self.W1[i]) + self.b1[i]
-            ffn_op = F.gelu(ffn_op)
-            ffn_op = torch.matmul(ffn_op, self.W2[i]) + self.b2[i]
-            ffn_op = F.dropout(ffn_op, self.dropout, self.training)
-            # Add+layernorm
-            x = (ffn_op + x) / 2
-        return x
+        # Initialize weights
+        torch.nn.init.xavier_uniform_(self.Wq)
+        torch.nn.init.xavier_uniform_(self.Wk)
+        torch.nn.init.xavier_uniform_(self.Wv)
+        torch.nn.init.xavier_uniform_(self.Wo)
 
-# class SelfAttentionBlock(torch.nn.Module):
-#     def __init__(self, d_model, num_heads, dropout_rate=0.1, attention_dropout_rate=0.1):
-#         super().__init__()
-#         self.d_model = d_model
-#         self.num_heads = num_heads
-#         self.d_k = d_model // num_heads # dimension per head
+    def forward(self, x, padding_mask):
+        # x: bsz, max_len, d_model
+        # padding_mask: bsz, max_len (True for real tokens, False for padding)
 
-#         # Linear layers for Q, K, V projections (for one layer/head_set)
-#         self.Wq = torch.nn.Parameter(torch.empty(num_heads, d_model, self.d_k))
-#         self.Wk = torch.nn.Parameter(torch.empty(num_heads, d_model, self.d_k))
-#         self.Wv = torch.nn.Parameter(torch.empty(num_heads, d_model, self.d_k))
-#         self.Wo = torch.nn.Parameter(torch.empty(num_heads * self.d_k, d_model))
+        bsz, max_len, d_model = x.size()
+        h = self.num_heads
 
-#         self.dropout = dropout_rate
-#         self.attention_dropout = attention_dropout_rate
-
-#         # Initialize weights
-#         torch.nn.init.xavier_uniform_(self.Wq)
-#         torch.nn.init.xavier_uniform_(self.Wk)
-#         torch.nn.init.xavier_uniform_(self.Wv)
-#         torch.nn.init.xavier_uniform_(self.Wo)
-
-#     def forward(self, x, padding_mask):
-#         # x: bsz, max_len, d_model
-#         # padding_mask: bsz, max_len (True for real tokens, False for padding)
-
-#         bsz, max_len, d_model = x.size()
-#         h = self.num_heads
-
-#         attention_mask = padding_mask[:, :, None] * padding_mask[:, None, :] # (bsz, max_len, max_len)
-#         attention_mask = (1 - attention_mask).to(x.dtype) * torch.finfo(x.dtype).min # (bsz, max_len, max_len)
-#         attention_mask = attention_mask[:, None, :, :] # Add head dimension: (bsz, 1, max_len, max_len)
+        attention_mask = padding_mask[:, :, None] * padding_mask[:, None, :] # (bsz, max_len, max_len)
+        attention_mask = (1 - attention_mask).to(x.dtype) * torch.finfo(x.dtype).min # (bsz, max_len, max_len)
+        attention_mask = attention_mask[:, None, :, :] # Add head dimension: (bsz, 1, max_len, max_len)
 
 
-#         # 2. Multi-Head Attention (MHA) calculations
-#         # Q, K, V projections
-#         # 'bld,hde->bhle': (batch, length, d_model) @ (heads, d_model, d_k) -> (batch, heads, length, d_k)
-#         q = torch.einsum('bld,hde->bhle', x, self.Wq)
-#         k = torch.einsum('bld,hde->bhle', x, self.Wk)
-#         v = torch.einsum('bld,hde->bhle', x, self.Wv)
+        # 2. Multi-Head Attention (MHA) calculations
+        # Q, K, V projections
+        # 'bld,hde->bhle': (batch, length, d_model) @ (heads, d_model, d_k) -> (batch, heads, length, d_k)
+        q = torch.einsum('bld,hde->bhle', x, self.Wq)
+        k = torch.einsum('bld,hde->bhle', x, self.Wk)
+        v = torch.einsum('bld,hde->bhle', x, self.Wv)
 
-#         # Attention Scores (Q @ K_T)
-#         # 'bhle,bhke->bhlk': (batch, heads, length_q, d_k) @ (batch, heads, length_k, d_k) -> (batch, heads, length_q, length_k)
-#         A = torch.einsum('bhle,bhke->bhlk', q, k)
+        # Attention Scores (Q @ K_T)
+        # 'bhle,bhke->bhlk': (batch, heads, length_q, d_k) @ (batch, heads, length_k, d_k) -> (batch, heads, length_q, length_k)
+        A = torch.einsum('bhle,bhke->bhlk', q, k)
 
-#         # Apply dropout mask if training
-#         layer_mask = attention_mask # Start with padding mask
-#         if self.training:
-#             dropout_mask = (torch.rand_like(A) < self.attention_dropout).to(x.dtype) * torch.finfo(x.dtype).min
-#             layer_mask = attention_mask + dropout_mask # Combine padding and attention dropout masks
+        # Apply dropout mask if training
+        layer_mask = attention_mask # Start with padding mask
+        if self.training:
+            dropout_mask = (torch.rand_like(A) < self.attention_dropout).to(x.dtype) * torch.finfo(x.dtype).min
+            layer_mask = attention_mask + dropout_mask # Combine padding and attention dropout masks
 
-#         A = A + layer_mask # Apply combined mask to scores
-#         A = torch.softmax(A, dim=-1) # Softmax to get attention probabilities
+        A = A + layer_mask # Apply combined mask to scores
+        A = torch.softmax(A, dim=-1) # Softmax to get attention probabilities
 
-#         v_out = torch.einsum('bhkl,bhle->bkhe', A, v)
+        v_out = torch.einsum('bhkl,bhle->bkhe', A, v)
 
-#         # Concatenate heads and apply final linear projection
-#         all_head_op = v_out.reshape((bsz, max_len, -1)) # Reshape to (bsz, max_len, num_heads * d_k)
-#         all_head_op = torch.matmul(all_head_op, self.Wo) # Final projection back to d_model
-#         all_head_op = F.dropout(all_head_op, self.dropout, self.training) # Dropout on output
+        # Concatenate heads and apply final linear projection
+        all_head_op = v_out.reshape((bsz, max_len, -1)) # Reshape to (bsz, max_len, num_heads * d_k)
+        all_head_op = torch.matmul(all_head_op, self.Wo) # Final projection back to d_model
+        all_head_op = F.dropout(all_head_op, self.dropout, self.training) # Dropout on output
 
-#         # 3. Residual connection and "normalization"
-#         x_out = (all_head_op + x) / 2 # Your custom averaging normalization
+        # 3. Residual connection and "normalization"
+        x_out = (all_head_op + x) / 2 # Your custom averaging normalization
 
-#         return x_out
+        return x_out
 
 class Block_mamba(nn.Module):
     def __init__(self,
@@ -328,14 +266,14 @@ class Block_mamba(nn.Module):
         return x
 
 
-class Triplet_Mamba(TimeSeriesModel):
+class HyMaTE(TimeSeriesModel):
     def __init__(self, args: Namespace):
         super().__init__(args)
         self.cve_time = CVE(args)
         self.cve_value = CVE(args)
         self.variable_emb = nn.Embedding(args.V, args.hid_dim)
         self.mamba = Block_mamba(args.hid_dim, args.num_blocks)
-        # self.self_att = SelfAttentionBlock(args.hid_dim, args.num_layers)
+        self.self_att = SelfAttentionBlock(args.hid_dim, args.num_layers)
         self.fusion_att = FusionAtt(args)
         self.dropout = args.dropout
         self.V = args.V
